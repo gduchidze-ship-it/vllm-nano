@@ -3,8 +3,9 @@ from dataclasses import dataclass, field
 import torch
 from transformers import AutoConfig, PretrainedConfig
 
-from vllm_nano.utils.device import get_device
 from vllm_nano.constants import _DTYPES
+from vllm_nano.utils.device import get_device
+
 
 @dataclass(frozen=True)
 class ModelConfig:
