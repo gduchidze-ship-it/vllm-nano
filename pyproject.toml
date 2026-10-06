@@ -1,0 +1,5 @@
+[dependency-groups]
+dev = [
+    "torch==2.14.1",
+    "transformers==5.18.0",
+]
