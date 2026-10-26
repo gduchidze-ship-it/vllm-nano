@@ -28,11 +28,12 @@ from vllm_nano.core.kv_cache import BlockAllocator, BlockTable, PagedKVCache
 
 
 class PagedCache:
-    """One forward pass's view over a shared paged pool.
+    """A view over a shared paged pool, shaped like Hugging Face's cache.
 
-    Holds one `BlockTable` per batch row. All rows advance together -- which is true
-    for a batch of sequences being decoded in lockstep, including left-padded rows
-    whose pad tokens are stored and then masked out by attention.
+    Holds one `BlockTable` per batch row, and translates the four cache calls above
+    into block allocation, per-layer writes, and a gather. All rows advance together
+    -- which is true for a batch of sequences decoded in lockstep, including
+    left-padded rows whose pad tokens are stored and then masked out by attention.
     """
 
     def __init__(
@@ -122,6 +123,8 @@ class PagedCache:
         # explicitly -- otherwise attention would not see the token it is processing.
         length = self.tables[0].num_tokens + self._pending
         gathered = [self.cache.gather(table, layer_idx, length=length) for table in self.tables]
+        # Per row, then a stack: for B>1 this copies the history twice. Both copies
+        # are on the list of things the block-wise kernel deletes.
         keys = torch.stack([k for k, _ in gathered])
         values = torch.stack([v for _, v in gathered])
 

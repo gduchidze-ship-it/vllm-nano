@@ -52,6 +52,24 @@
 - Padding also allocates cache for tokens that do not exist, and the padded width is the longest prompt in the batch. That is the concrete motivation for paging (step 3).
 - `cache` is keyword-only in `forward`, because `forward(ids, cache)` silently bound the cache to `attention_mask` and failed with a confusing `.to` error.
 
+## Our own attention (step 3, rung 1)
+- `models/attention.py` is a readable copy of Qwen2 attention: proj -> `(b, s, h, d)` -> `(b, h, s, d)` -> RoPE -> cache update -> `q k^T * scale + mask` -> softmax in fp32 -> `@ v` -> `o_proj`.
+- Verified against HF: prefill and 4 decode steps agree within **3e-8**, cache contents match, and `generate()` picks the same tokens.
+- **The mask is built by the model, not by attention.** With `_attn_implementation="sdpa"` the model passes `attention_mask=None` and expects the kernel to be causal. Our eager matmuls then attend in *both* directions: logits drifted by 0.21 and the output still looked like text. `swap_attention()` sets the flag to `"eager"`; `test_attention_is_causal_even_after_the_swap` guards it (position 0 must not change when later tokens change).
+- GQA: K/V are repeated `num_attention_heads // num_kv_heads` times before the matmul. A kernel indexes heads instead of copying.
+- The seam for paging is a single statement: `key, value = past_key_values.update(key, value, self.layer_idx)`.
+
+## Paging in the attention loop (step 3, rung 2)
+- The model never touches the cache directly. It asks `past_key_values` four questions -- `get_seq_length()`, `get_query_offset()`, `get_mask_sizes(q_len)` and once per layer `update(k, v, layer_idx)` -- so anything that answers them *is* a cache. `models/paged_cache.py` is that translator; no model code changed.
+- A step is **two-phase** because attention runs one layer at a time: `begin_step` (allocate blocks), `write_layer` x layers, `commit` (advance the length). Advance inside the layer loop and layer 1 writes one step later than layer 0 -- the same bug the contiguous cache documents.
+- Mid-step the blocks hold tokens that are written but not committed, so attention calls `gather(table, layer, length=past + new)` explicitly. Committed only would hide the token being processed.
+- Layer 0 opens a step and the last layer closes it. That is an assumption about the decoder loop (layers run 0..N-1 exactly once per forward), written down in `PagedCache.update` and enforced by a counter check.
+- Verified: logits are **bit-identical** to the `DynamicCache` path (`torch.equal`, not allclose) for prefill, decode and a left-padded batch; stored K/V identical per layer; greedy tokens identical to HF.
+- Batching is a loop over block tables: one table per row, `key_states[row]` written into `tables[row]`. Paging is per sequence; the batch is the outer loop.
+- Still contiguous in the end: `update` returns the whole history via `gather`, a copy of every block. That copy is exactly what a real PagedAttention kernel removes (rung 3) -- do not benchmark this rung and conclude paging is slow.
+- Left-padded rows: logits at **pad** positions differ from HF by ~0.11, because when every key is masked both sides produce arbitrary junk and produce it differently. Harmless (no real token attends to a pad), but it means `torch.equal` against HF only holds for real positions -- compare against our own `DynamicCache` path instead.
+- `torch.stack` in `update` gathers each row separately; for B>1 that is a second copy, paid per layer per step. Another thing rung 3 deletes.
+
 ## Questions to answer
 - Prompt of 5 tokens: what is `logits.shape`, and what does each dimension mean?
 - Why does the next token come only from the last position's logits?
@@ -60,4 +78,7 @@
 - Position `p` of a row with 3 left pads: what does `cumsum(mask) - 1` give at its first real token, and why is 0 the right answer?
 - Why does `position_ids` matter when feeding one token at a time?
 - Why are `LLMEngine` and `ModelRunner` separate classes?
+- `commit` runs after the last layer of a step. What breaks if it runs inside `write_layer`?
+- During a step, does the causal mask need the committed length or committed + new? Why?
+- In a batched paged cache, where does the mapping from (row, position) to memory live?
 - KV cache in bf16 for 1000 tokens, in MB? How many tokens fit in a 3 GB budget in fp32 vs bf16?

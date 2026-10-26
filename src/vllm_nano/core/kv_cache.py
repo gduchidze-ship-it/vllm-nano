@@ -332,6 +332,14 @@ class PagedKVCache:
         `keys`/`values` are that layer only: (num_kv_heads, n_tokens, head_dim).
         """
         self._check_layer(layer)
+        for tensor in (keys, values):
+            # Writing bf16 into an fp32 pool "works" (a silent cast) and then breaks
+            # where it is hard to see: gather hands attention an fp32 history.
+            if tensor.dtype != self._k.dtype or tensor.device != self._k.device:
+                raise ValueError(
+                    f"pool is {self._k.dtype} on {self._k.device}, but this step is "
+                    f"{tensor.dtype} on {tensor.device}; build the pool to match the model"
+                )
         n_keys = _check_layer_tensor(keys, num_kv_heads=self.num_kv_heads, head_dim=self.head_dim)
         n_values = _check_layer_tensor(
             values, num_kv_heads=self.num_kv_heads, head_dim=self.head_dim

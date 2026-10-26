@@ -125,6 +125,21 @@ def test_writing_without_reserving_blocks_is_rejected():
         pool.write_layer(BlockTable(), 0, keys[0], keys[0])
 
 
+def test_a_pool_with_the_wrong_dtype_is_rejected():
+    """The pool must match the model; a silent cast would surface far from here."""
+    pool = PagedKVCache(
+        num_blocks=4,
+        block_size=BLOCK,
+        num_layers=LAYERS,
+        num_kv_heads=KV_HEADS,
+        head_dim=HEAD_DIM,
+        dtype=torch.float16,
+    )
+
+    with pytest.raises(ValueError, match="build the pool to match the model"):
+        pool.append(BlockAllocator(4), BlockTable(), *make_step(2))
+
+
 def test_a_step_that_spans_two_blocks_is_split():
     """4 tokens into blocks of 3: the write lands as 3 + 1 in two different blocks."""
     pool = new_pool()

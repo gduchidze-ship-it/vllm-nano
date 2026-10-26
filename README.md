@@ -8,7 +8,7 @@ Built **for learning**: every piece is written manually to understand how modern
 ## Roadmap
 - [x] Single-request generation with a naive KV cache
 - [x] Batched generation with padding
-- [ ] Paged KV cache (block allocator + block table)
+- [x] Paged KV cache (block allocator + block table)
 - [ ] Scheduler + continuous batching
 - [ ] Sampling strategies
 - [ ] Simple API / CLI
