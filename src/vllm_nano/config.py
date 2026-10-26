@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 import torch
 from transformers import AutoConfig, PretrainedConfig
 
-from vllm_nano.constants import _DTYPES
+from vllm_nano.constants import DTYPES
 from vllm_nano.utils.device import get_device
 
 
@@ -25,21 +25,20 @@ class ModelConfig:
     resolved_max_model_len: int = field(init=False)
 
     def __post_init__(self) -> None:
-        hf_config = AutoConfig.from_pretrained(
-            self.model, trust_remote_code=self.trust_remote_code
-        )
+        hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=self.trust_remote_code)
         device = get_device() if self.device == "auto" else self.device
         # float32 by default so greedy output matches HF token for token.
         dtype_name = "float32" if self.dtype == "auto" else self.dtype
-        if dtype_name not in _DTYPES:
-            raise ValueError(f"Unsupported dtype {self.dtype!r}; use one of {list(_DTYPES)} or 'auto'")
+        if dtype_name not in DTYPES:
+            options = list(DTYPES)
+            raise ValueError(f"Unsupported dtype {self.dtype!r}; use one of {options} or 'auto'")
         model_limit = hf_config.max_position_embeddings
         max_len = self.max_model_len or model_limit
         if max_len > model_limit:
             raise ValueError(f"max_model_len {max_len} exceeds model limit {model_limit}")
 
         object.__setattr__(self, "hf_config", hf_config)
-        object.__setattr__(self, "torch_dtype", _DTYPES[dtype_name])
+        object.__setattr__(self, "torch_dtype", DTYPES[dtype_name])
         object.__setattr__(self, "resolved_device", device)
         object.__setattr__(self, "resolved_max_model_len", max_len)
 

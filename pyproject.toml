@@ -23,3 +23,21 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.10",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E/F: pycodestyle + pyflakes. I: import order. UP: modern syntax. B: likely bugs.
+# SIM: simplifications. Keep this list short and defensible; add rules when they bite.
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+markers = [
+    "slow: downloads a real model and takes ~20s; run with `pytest -m slow`",
+]

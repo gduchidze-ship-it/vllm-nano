@@ -1,5 +1,6 @@
 import torch
 from transformers import PreTrainedModel
+from transformers.cache_utils import Cache
 
 
 class ModelRunner:
@@ -10,8 +11,20 @@ class ModelRunner:
         self.device = device
 
     @torch.inference_mode()  # no gradients on every call, so it cannot be forgotten
-    def next_token(self, input_ids: torch.Tensor) -> int:
-        """Return the greedy next token id for a (1, seq_len) tensor of token ids."""
-        logits = self.model(input_ids=input_ids.to(self.device)).logits
-        # Last position of the only sequence; int() copies the result off the GPU.
-        return int(logits[0, -1].argmax())
+    def forward(
+        self, input_ids: torch.Tensor, cache: Cache | None = None
+    ) -> tuple[torch.Tensor, Cache]:
+        """Run one forward pass; return the LAST position's logits and the KV cache.
+
+        `input_ids` is (1, L). The first call passes the whole prompt (prefill) and
+        returns a cache holding L tokens. Every later call passes exactly one token
+        (decode): the model reads the past K/V from `cache` and appends its own, so
+        the cost of a step no longer grows with the sequence.
+        """
+        out = self.model(
+            input_ids=input_ids.to(self.device),
+            past_key_values=cache,
+            use_cache=True,
+        )
+        # (1, L, vocab) -> (vocab,): only the last position can predict the next token.
+        return out.logits[0, -1], out.past_key_values

@@ -6,7 +6,7 @@ Built **for learning**: every piece is written manually to understand how modern
 > Not production software. Readability over speed, understanding over features.
 
 ## Roadmap
-- [ ] Single-request generation with a naive KV cache
+- [x] Single-request generation with a naive KV cache
 - [ ] Batched generation with padding
 - [ ] Paged KV cache (block allocator + block table)
 - [ ] Scheduler + continuous batching

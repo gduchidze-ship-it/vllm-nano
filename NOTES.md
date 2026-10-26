@@ -32,6 +32,16 @@
 - Secrets (Bearer / `hf_` tokens) are scrubbed from messages and `extra`, not from tracebacks.
 - JSON file in `logs/` (git-ignored) for analysis; Rich console for humans.
 
+## KV cache (roadmap step 1)
+- One method, two modes: `forward(ids, cache=None)`. `cache is None` = **prefill** (whole prompt, cache 0 -> L). Every later call passes **one** token and the cache grows by 1 = **decode**.
+- Why it is legal: causal attention means the logits at position t depend only on tokens <= t. So cached decode must reproduce one full forward at the same position. Test: tiny model, `torch.allclose(..., atol=1e-6)`; measured max diff ~3e-8 in fp32.
+- Work per token: prefill is O(L) once. Each decode is O(1) in sequence length for the matmuls (attention still reads the L cached K/V, but nothing is recomputed). Before: O(n) work per step, O(n^2) total.
+- No `attention_mask` needed for a single unpadded sequence: transformers derives `cache_position` from the cache length. We need it as soon as a batch is padded (step 2).
+- `DynamicCache` grows **in place** and the model returns the same object. Always use the returned cache; a reference you kept "before" now reports the new length.
+- Do NOT send the whole sequence with a warm cache: the prompt is already in it, so every token is attended twice and the logits are silently wrong. There is a test that asserts the two differ.
+- Memory: 2 (K and V) x layers x kv_heads x head_dim x bytes per token = **24 KB fp32** for Qwen 0.5B (24 MB at 1k, 96 MB at 4k, 768 MB at 32k). Context length costs memory linearly; paging (step 3) is how vLLM spends it in blocks instead of per-sequence slabs.
+- The engine now runs one forward per generated token: 1 prefill + (n-1) decodes, and EOS breaks before the decode nobody would read.
+
 ## Questions to answer
 - Prompt of 5 tokens: what is `logits.shape`, and what does each dimension mean?
 - Why does the next token come only from the last position's logits?

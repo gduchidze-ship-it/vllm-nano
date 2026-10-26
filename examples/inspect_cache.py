@@ -27,7 +27,9 @@ def main() -> None:
         layer0 = cache.layers[0]
         logger.info(
             "cache type {}, layers {}, seq_len {}",
-            type(cache).__name__, len(cache), cache.get_seq_length(),
+            type(cache).__name__,
+            len(cache),
+            cache.get_seq_length(),
         )
         # Shape: (batch, kv_heads, seq_len, head_dim) = (1, 2, 5, 64) for Qwen2.5-0.5B.
         logger.info("layer 0 K {} V {}", tuple(layer0.keys.shape), tuple(layer0.values.shape))
@@ -40,8 +42,12 @@ def main() -> None:
             for lyr in cache.layers
         )
         formula = (
-            2 * config.num_layers * config.num_kv_heads * config.head_dim
-            * torch.finfo(config.torch_dtype).bits // 8
+            2
+            * config.num_layers
+            * config.num_kv_heads
+            * config.head_dim
+            * torch.finfo(config.torch_dtype).bits
+            // 8
         )
         logger.info("bytes per token: measured {}, formula {}", total / prompt_len, formula)
 
@@ -51,7 +57,8 @@ def main() -> None:
         out2 = model(input_ids=next_id, past_key_values=cache, use_cache=True)
         logger.info(
             "after decode: seq_len {}, layer 0 K {}",
-            cache.get_seq_length(), tuple(cache.layers[0].keys.shape),
+            cache.get_seq_length(),
+            tuple(cache.layers[0].keys.shape),
         )
         # The model appended to the cache we passed in (in place) and returned the same object.
         logger.info("same cache object returned: {}", out2.past_key_values is cache)
