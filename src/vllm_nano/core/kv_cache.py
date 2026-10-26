@@ -7,7 +7,9 @@ Two implementations, deliberately in this order:
 * `PagedKVCache` -- a pool of fixed-size blocks plus a per-sequence `BlockTable`.
                     A sequence's K/V can live in blocks scattered anywhere in the
                     pool, so it grows without copying and without reserving `max_len`
-                    for every request.
+                    for every request. A step is written with `begin_step` (allocate),
+                    `write_layer` (once per layer) and `commit` (advance the length),
+                    because a transformer hands attention one layer at a time.
 
 Shapes (one sequence, no batch dimension -- paging is inherently per sequence):
 
@@ -27,6 +29,21 @@ from collections import deque
 from dataclasses import dataclass, field
 
 import torch
+
+
+def _check_layer_tensor(tensor: torch.Tensor, *, num_kv_heads: int, head_dim: int) -> int:
+    """Validate one layer's slice of a step and return how many tokens it carries.
+
+    Shape must be (num_kv_heads, n_tokens, head_dim). Checking this *before* writing
+    matters: a transposed tensor silently stores the right number of numbers in the
+    wrong places, which no later assertion can untangle.
+    """
+    if tensor.ndim != 3 or tensor.shape[0] != num_kv_heads or tensor.shape[2] != head_dim:
+        raise ValueError(
+            f"expected (num_kv_heads={num_kv_heads}, n_tokens, head_dim={head_dim}), "
+            f"got {tuple(tensor.shape)}"
+        )
+    return tensor.shape[1]
 
 
 def _check_step(
@@ -49,14 +66,10 @@ def _check_step(
 
     n_tokens: int | None = None
     for tensor in (*keys, *values):
-        if tensor.ndim != 3 or tensor.shape[0] != num_kv_heads or tensor.shape[2] != head_dim:
-            raise ValueError(
-                f"expected (num_kv_heads={num_kv_heads}, n_tokens, head_dim={head_dim}), "
-                f"got {tuple(tensor.shape)}"
-            )
+        layer_tokens = _check_layer_tensor(tensor, num_kv_heads=num_kv_heads, head_dim=head_dim)
         if n_tokens is None:
-            n_tokens = tensor.shape[1]
-        elif tensor.shape[1] != n_tokens:
+            n_tokens = layer_tokens
+        elif layer_tokens != n_tokens:
             raise ValueError("every layer must advance by the same number of tokens")
     return n_tokens if n_tokens is not None else 0
 
@@ -281,7 +294,12 @@ class PagedKVCache:
         keys: list[torch.Tensor],
         values: list[torch.Tensor],
     ) -> None:
-        """Write one step for one sequence, allocating blocks as the sequence grows."""
+        """Write one step for one sequence, allocating blocks as the sequence grows.
+
+        Convenience wrapper around begin/write/commit for callers that have every
+        layer in hand at once (tests, offline replay). A transformer does not: it
+        calls attention one layer at a time, which is why the three primitives exist.
+        """
         n_tokens = _check_step(
             keys,
             values,
@@ -289,47 +307,118 @@ class PagedKVCache:
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
         )
-        needed_blocks = math.ceil((table.num_tokens + n_tokens) / self.block_size)
+        self.begin_step(allocator, table, n_tokens)
+        for layer in range(self.num_layers):
+            self.write_layer(table, layer, keys[layer], values[layer])
+        self.commit(table, n_tokens)
+
+    def begin_step(self, allocator: BlockAllocator, table: BlockTable, n_tokens: int) -> None:
+        """Reserve space for `n_tokens` more tokens, without advancing the length.
+
+        Reserving and advancing are separate because a step is written one layer at
+        a time. Every layer must write at the same offset, so the offset can only move
+        after the last layer has written -- that is `commit`. Advance inside the layer
+        loop and layer 1 lands one step later than layer 0, forever.
+        """
+        if n_tokens < 0:
+            raise ValueError(f"n_tokens must not be negative, got {n_tokens}")
+        self._grow(allocator, table, table.num_tokens + n_tokens)
+
+    def write_layer(
+        self, table: BlockTable, layer: int, keys: torch.Tensor, values: torch.Tensor
+    ) -> None:
+        """Write one layer's slice of the current step, still without advancing.
+
+        `keys`/`values` are that layer only: (num_kv_heads, n_tokens, head_dim).
+        """
+        self._check_layer(layer)
+        n_keys = _check_layer_tensor(keys, num_kv_heads=self.num_kv_heads, head_dim=self.head_dim)
+        n_values = _check_layer_tensor(
+            values, num_kv_heads=self.num_kv_heads, head_dim=self.head_dim
+        )
+        if n_keys != n_values:
+            raise ValueError(f"keys carry {n_keys} tokens, values carry {n_values}")
+        # Blocks must already exist: writing into a block id that was never handed out
+        # would go to another sequence's memory.
+        capacity = len(table.block_ids) * self.block_size
+        if table.num_tokens + n_keys > capacity:
+            raise RuntimeError(
+                f"writing {n_keys} tokens at {table.num_tokens} needs "
+                f"{math.ceil((table.num_tokens + n_keys) / self.block_size)} blocks, "
+                f"but only {len(table.block_ids)} were reserved; call begin_step first"
+            )
+
+        for block_id, offset, take, src_start in _write_segments(
+            table, table.num_tokens, n_keys, self.block_size
+        ):
+            window = slice(offset, offset + take)
+            source = slice(src_start, src_start + take)
+            self._k[block_id, layer, :, window, :] = keys[:, source, :]
+            self._v[block_id, layer, :, window, :] = values[:, source, :]
+
+    def commit(self, table: BlockTable, n_tokens: int) -> None:
+        """Advance the sequence past the `n_tokens` just written.
+
+        One call per step, after every layer. From here on those tokens are part of
+        the cache and show up in `gather` and in the mask's length.
+        """
+        if n_tokens < 0:
+            raise ValueError(f"n_tokens must not be negative, got {n_tokens}")
+        capacity = len(table.block_ids) * self.block_size
+        if table.num_tokens + n_tokens > capacity:
+            raise RuntimeError(
+                f"committing {n_tokens} tokens at {table.num_tokens} would pass the "
+                f"{capacity} reserved slots; call begin_step first"
+            )
+        table.num_tokens += n_tokens
+
+    def _grow(self, allocator: BlockAllocator, table: BlockTable, total_tokens: int) -> None:
+        """Make sure the table has enough blocks for `total_tokens` tokens."""
+        needed_blocks = math.ceil(total_tokens / self.block_size)
         if needed_blocks > self.num_blocks:
             raise RuntimeError(
                 f"sequence needs {needed_blocks} blocks but the pool has {self.num_blocks}"
             )
 
-        # Grow the table first: growth is one id appended per new block, never a copy.
+        # Growth is one id appended per new block, never a copy of past tokens.
         while len(table.block_ids) < needed_blocks:
             table.block_ids.append(allocator.allocate())
 
-        for layer in range(self.num_layers):
-            for block_id, offset, take, src_start in _write_segments(
-                table, table.num_tokens, n_tokens, self.block_size
-            ):
-                window = slice(offset, offset + take)
-                source = slice(src_start, src_start + take)
-                self._k[block_id, layer, :, window, :] = keys[layer][:, source, :]
-                self._v[block_id, layer, :, window, :] = values[layer][:, source, :]
-
-        table.num_tokens += n_tokens
-
-    def gather(self, table: BlockTable, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def gather(
+        self, table: BlockTable, layer: int, length: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Collect one layer's blocks into a contiguous (kv_heads, length, head_dim).
+
+        `length` defaults to the committed length. Pass it explicitly to include the
+        tokens of a step that has been written but not yet committed -- which is
+        exactly what attention needs: it must see the token it is processing.
 
         This copy is the cost PagedAttention removes: a real kernel attends block by
         block instead of materializing the contiguous view. Correct first, fast later.
         """
-        if not 0 <= layer < self.num_layers:
-            raise IndexError(f"layer {layer} out of range 0..{self.num_layers - 1}")
-        if table.num_tokens == 0:
+        self._check_layer(layer)
+        length = table.num_tokens if length is None else length
+        if length > len(table.block_ids) * self.block_size:
+            raise RuntimeError(
+                f"asked for {length} tokens but only {len(table.block_ids)} blocks "
+                f"are reserved ({len(table.block_ids) * self.block_size} slots)"
+            )
+        if length == 0:
             empty = torch.empty(
                 self.num_kv_heads, 0, self.head_dim, dtype=self._k.dtype, device=self._k.device
             )
             return empty, empty.clone()
 
-        used_blocks = math.ceil(table.num_tokens / self.block_size)
+        used_blocks = math.ceil(length / self.block_size)
         block_ids = table.block_ids[:used_blocks]
         # (block_size) is dim 1 of one block's slice, so cat along dim=1 joins positions.
         k = torch.cat([self._k[block_id, layer] for block_id in block_ids], dim=1)
         v = torch.cat([self._v[block_id, layer] for block_id in block_ids], dim=1)
-        return k[:, : table.num_tokens, :], v[:, : table.num_tokens, :]
+        return k[:, :length, :], v[:, :length, :]
+
+    def _check_layer(self, layer: int) -> None:
+        if not 0 <= layer < self.num_layers:
+            raise IndexError(f"layer {layer} out of range 0..{self.num_layers - 1}")
 
     def free(self, allocator: BlockAllocator, table: BlockTable) -> None:
         """Return every block to the allocator. Forgetting this call is a leak."""

@@ -131,8 +131,10 @@ class Qwen2Attention(nn.Module):
         cos, sin = position_embeddings
         query, key = apply_rotary(query, key, cos, sin)
 
-        # The one line that will change in the paged version: this is where the past
-        # comes back. HF appends here and returns the whole contiguous history.
+        # One line, two very different caches. HF's `DynamicCache` concatenates into
+        # contiguous buffers; our `PagedCache` writes into scattered blocks and
+        # gathers the history back. Attention cannot tell the difference -- which is
+        # exactly why paging can be introduced here without touching the math.
         if past_key_values is not None:
             key, value = past_key_values.update(key, value, self.layer_idx)
 
