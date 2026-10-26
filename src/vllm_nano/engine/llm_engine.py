@@ -1,3 +1,4 @@
+import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from vllm_nano.engine.model_runner import ModelRunner
@@ -31,35 +32,73 @@ class LLMEngine:
         self.tokenizer = tokenizer
         self.eos_ids = eos_ids
         self.max_model_len = max_model_len
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
     def generate_ids(self, prompt: str, max_new_tokens: int) -> GenerationResult:
-        """Greedy-decode up to `max_new_tokens`; the EOS token is included, like HF."""
+        """One prompt: a batch of one. Kept because most tests and examples want this."""
+        return self.generate_batch([prompt], max_new_tokens)[0]
+
+    def generate_batch(self, prompts: list[str], max_new_tokens: int) -> list[GenerationResult]:
+        """Greedy-decode a batch; one forward pass per step covers every row.
+
+        All sequences must be rectangular, so prompts are padded. LEFT padding keeps
+        every real sequence flush against the right edge, which is what makes
+        `logits[:, -1]` the next-token position for every row.
+        """
+        if not prompts:
+            raise ValueError("prompts must not be empty")
         if max_new_tokens < 1:
             raise ValueError(f"max_new_tokens must be at least 1, got {max_new_tokens}")
 
-        ids = self.tokenizer(prompt, return_tensors="pt").input_ids
-        prompt_len = ids.shape[1]  # (batch=1, seq_len); no padding yet, so this is real
+        encoded = self.tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
+        ids = encoded.input_ids  # (batch, longest prompt); shorter prompts start with pads
+        mask = encoded.attention_mask  # (batch, longest prompt); 0 = pad
+        batch, prompt_len = ids.shape
         if prompt_len + max_new_tokens > self.max_model_len:
             raise ValueError(
-                f"prompt ({prompt_len}) + max_new_tokens ({max_new_tokens}) exceeds "
-                f"max_model_len ({self.max_model_len})"
+                f"longest prompt ({prompt_len}) + max_new_tokens ({max_new_tokens}) "
+                f"exceeds max_model_len ({self.max_model_len})"
             )
 
-        # Prefill: one pass over the prompt fills the cache. Every step after this
-        # feeds a single token, so the work per token is constant instead of O(n).
-        logits, cache = self.runner.forward(ids)
-        new_tokens: list[int] = []
-        finish_reason: str = "length"
+        # Left pads must not shift a sequence's positions. Rotate-embedding models do
+        # not care about a uniform shift (positions are relative), but absolute-position
+        # and ALiBi models do, and this is the model-agnostic way to be right.
+        position_ids = (mask.cumsum(-1) - 1).clamp(min=0)
+
+        logits, cache = self.runner.forward(ids, attention_mask=mask, position_ids=position_ids)
+
+        tokens: list[list[int]] = [[] for _ in range(batch)]
+        finished = [False] * batch
+        reasons: list[str] = ["length"] * batch  # until proven otherwise
+
         for step in range(max_new_tokens):
-            tok = int(logits.argmax())  # greedy; a sampler replaces this at step 5
-            new_tokens.append(tok)  # append BEFORE the check so EOS is kept
-            if tok in self.eos_ids:
-                finish_reason = "stop"
+            next_ids = logits.argmax(-1)  # (batch,): greedy, a sampler replaces this at step 5
+            for row in range(batch):
+                if finished[row]:
+                    continue  # already reported; its slot is still occupied until the batch ends
+                tok = int(next_ids[row])
+                tokens[row].append(tok)  # append BEFORE the check so EOS is kept
+                if tok in self.eos_ids:
+                    finished[row] = True
+                    reasons[row] = "stop"
+                elif step + 1 == max_new_tokens:
+                    finished[row] = True
+
+            if step + 1 == max_new_tokens or all(finished):
                 break
-            if step + 1 < max_new_tokens:  # no point decoding a token nobody will read
-                # .new_tensor keeps the dtype and device of `ids`.
-                logits, cache = self.runner.forward(ids.new_tensor([[tok]]), cache)
-        return GenerationResult(token_ids=new_tokens, finish_reason=finish_reason)
+
+            feed = next_ids.clone()
+            feed[finished] = self.pad_token_id
+            mask = torch.cat([mask, mask.new_ones((batch, 1))], dim=1)
+            position_ids = (mask.cumsum(-1) - 1)[:, -1:]
+            logits, cache = self.runner.forward(
+                feed.view(batch, 1),
+                attention_mask=mask,
+                position_ids=position_ids,
+                cache=cache,
+            )
+
+        return [GenerationResult(tokens[row], reasons[row]) for row in range(batch)]
 
     def generate(self, prompt: str, max_new_tokens: int = 50) -> str:
         """Text version of `generate_ids`, for humans."""

@@ -42,10 +42,22 @@
 - Memory: 2 (K and V) x layers x kv_heads x head_dim x bytes per token = **24 KB fp32** for Qwen 0.5B (24 MB at 1k, 96 MB at 4k, 768 MB at 32k). Context length costs memory linearly; paging (step 3) is how vLLM spends it in blocks instead of per-sequence slabs.
 - The engine now runs one forward per generated token: 1 prefill + (n-1) decodes, and EOS breaks before the decode nobody would read.
 
+## Batching (roadmap step 2)
+- One forward per step now serves the whole batch: logits are (batch, vocab) and the engine samples one token per row.
+- **Left padding only.** Real sequences end flush against the right edge, so `logits[:, -1]` is the next-token position for every row. Right padding would make that column a pad.
+- `attention_mask` must cover **cache + new token** (width grows by one per step). A stale, unpadded mask is accepted silently and gives wrong logits (~0.05 difference on the tiny model) — there is a test for it.
+- `position_ids = (mask.cumsum(-1) - 1).clamp(min=0)`: pads must not shift a sequence's positions.
+  - Measured surprise: passing `arange` instead does **not** break Qwen. RoPE is relative, and left padding shifts a row's tokens *uniformly*, which cancels out. It matters for absolute-position and ALiBi models, so we pass it explicitly anyway — it is free and model-agnostic.
+- Static batching: finished rows keep their slot and are fed `pad_token_id` until the batch ends; their output is ignored. Simple, and obviously wasteful — that waste is what continuous batching (step 4) removes.
+- Padding also allocates cache for tokens that do not exist, and the padded width is the longest prompt in the batch. That is the concrete motivation for paging (step 3).
+- `cache` is keyword-only in `forward`, because `forward(ids, cache)` silently bound the cache to `attention_mask` and failed with a confusing `.to` error.
+
 ## Questions to answer
 - Prompt of 5 tokens: what is `logits.shape`, and what does each dimension mean?
 - Why does the next token come only from the last position's logits?
 - During cached decode, what shape is `input_ids`? What shape is K for one layer?
+- In a left-padded batch, what is `logits[:, -1]` for the shortest prompt, and why is it not a pad?
+- Position `p` of a row with 3 left pads: what does `cumsum(mask) - 1` give at its first real token, and why is 0 the right answer?
 - Why does `position_ids` matter when feeding one token at a time?
 - Why are `LLMEngine` and `ModelRunner` separate classes?
 - KV cache in bf16 for 1000 tokens, in MB? How many tokens fit in a 3 GB budget in fp32 vs bf16?

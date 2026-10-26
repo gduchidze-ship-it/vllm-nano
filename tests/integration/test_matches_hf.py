@@ -53,3 +53,25 @@ def test_greedy_matches_hf(stack, prompt):
     # Same story for the stop reason: EOS in the reference output means we stopped on it.
     expected_reason = "stop" if expected and expected[-1] in eos_token_ids(model) else "length"
     assert actual.finish_reason == expected_reason
+
+
+BATCH_PROMPTS = ["2 + 2 =", "The capital of France is", "Write a short poem about the sea"]
+
+
+def test_batched_greedy_matches_hf(stack):
+    """One forward per step for 3 rows of different lengths must still match HF.
+
+    This is the real test of left padding + position_ids: a wrong pad side or a
+    position shift shows up as a token mismatch here.
+    """
+    engine, model, tokenizer, config = stack
+    results = engine.generate_batch(BATCH_PROMPTS, MAX_NEW_TOKENS)
+
+    for prompt, result in zip(BATCH_PROMPTS, results, strict=True):
+        inputs = tokenizer(prompt, return_tensors="pt").to(config.resolved_device)
+        out = model.generate(
+            **inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=False, repetition_penalty=1.0
+        )
+        expected = out[0, inputs.input_ids.shape[1] :].tolist()
+        diff_at = _first_diff(result.token_ids, expected)
+        assert result.token_ids == expected, f"batch mismatch for {prompt!r} at step {diff_at}"
