@@ -398,6 +398,8 @@ class PagedKVCache:
         """
         self._check_layer(layer)
         length = table.num_tokens if length is None else length
+        if length < 0:
+            raise ValueError(f"length must not be negative, got {length}")
         if length > len(table.block_ids) * self.block_size:
             raise RuntimeError(
                 f"asked for {length} tokens but only {len(table.block_ids)} blocks "
