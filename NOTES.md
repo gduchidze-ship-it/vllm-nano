@@ -57,18 +57,26 @@
 - Verified against HF: prefill and 4 decode steps agree within **3e-8**, cache contents match, and `generate()` picks the same tokens.
 - **The mask is built by the model, not by attention.** With `_attn_implementation="sdpa"` the model passes `attention_mask=None` and expects the kernel to be causal. Our eager matmuls then attend in *both* directions: logits drifted by 0.21 and the output still looked like text. `swap_attention()` sets the flag to `"eager"`; `test_attention_is_causal_even_after_the_swap` guards it (position 0 must not change when later tokens change).
 - GQA: K/V are repeated `num_attention_heads // num_kv_heads` times before the matmul. A kernel indexes heads instead of copying.
-- The seam for paging is a single statement: `key, value = past_key_values.update(key, value, self.layer_idx)`.
+- The seam for paging *looked* like a single statement (`key, value = past_key_values.update(...)`). That held while the paged cache still gathered a contiguous history (rung 2) and stops holding once it doesn't (rung 3).
 
 ## Paging in the attention loop (step 3, rung 2)
 - The model never touches the cache directly. It asks `past_key_values` four questions -- `get_seq_length()`, `get_query_offset()`, `get_mask_sizes(q_len)` and once per layer `update(k, v, layer_idx)` -- so anything that answers them *is* a cache. `models/paged_cache.py` is that translator; no model code changed.
 - A step is **two-phase** because attention runs one layer at a time: `begin_step` (allocate blocks), `write_layer` x layers, `commit` (advance the length). Advance inside the layer loop and layer 1 writes one step later than layer 0 -- the same bug the contiguous cache documents.
-- Mid-step the blocks hold tokens that are written but not committed, so attention calls `gather(table, layer, length=past + new)` explicitly. Committed only would hide the token being processed.
+- Mid-step the blocks hold tokens that are written but not committed, so `step_length()` is `committed + pending`. Attention must read the token it is processing.
 - Layer 0 opens a step and the last layer closes it. That is an assumption about the decoder loop (layers run 0..N-1 exactly once per forward), written down in `PagedCache.update` and enforced by a counter check.
-- Verified: logits are **bit-identical** to the `DynamicCache` path (`torch.equal`, not allclose) for prefill, decode and a left-padded batch; stored K/V identical per layer; greedy tokens identical to HF.
 - Batching is a loop over block tables: one table per row, `key_states[row]` written into `tables[row]`. Paging is per sequence; the batch is the outer loop.
-- Still contiguous in the end: `update` returns the whole history via `gather`, a copy of every block. That copy is exactly what a real PagedAttention kernel removes (rung 3) -- do not benchmark this rung and conclude paging is slow.
-- Left-padded rows: logits at **pad** positions differ from HF by ~0.11, because when every key is masked both sides produce arbitrary junk and produce it differently. Harmless (no real token attends to a pad), but it means `torch.equal` against HF only holds for real positions -- compare against our own `DynamicCache` path instead.
-- `torch.stack` in `update` gathers each row separately; for B>1 that is a second copy, paid per layer per step. Another thing rung 3 deletes.
+- Left-padded rows: logits at **pad** positions differ from HF by ~0.11, because when every key is masked both sides produce arbitrary junk and produce it differently. Harmless (no real token attends to a pad), but it means comparing against HF only makes sense at real positions -- compare the full tensor against our own `DynamicCache` path instead.
+
+## Block-wise attention (step 3, rung 3)
+- `paged_attention` is the payoff: `q @ K_block^T` per block, merged into a running softmax. `PagedKVCache.block()` returns a **view** of one block (a test asserts the data pointer matches), so attention multiplies straight against the pool. No tensor the length of the sequence is created anywhere.
+- Why a running softmax: you cannot normalize before seeing every score, and keeping every score defeats the point. Keep three accumulators and rescale them when the max grows:
+  `correction = exp(running_max - new_max)`, then `out = out * correction + exp(scores - new_max) @ V`. The first block's correction is 0 (the max starts at -inf), which is also why the initial state needs no special case.
+- The result equals the one-shot softmax mathematically, not bit-wise: additions happen in block order. Measured 9e-8 in fp32, same argmax at every step, greedy tokens identical to HF. `torch.equal` still applies to *storage* (layer 0's K/V are a pure copy) but no longer to output logits.
+- `PagedCache.update` no longer returns the history -- it hands back the step it was given. That API change is what makes the gather impossible rather than merely unused: attention must ask for blocks.
+- `test_paged_attention_never_gathers_the_history` monkeypatches `gather` to raise. Without it a reintroduced gather is invisible, because the output would still be correct.
+- Mask alignment: block b owns mask columns `[b * block_size, b * block_size + block_size)`. The last block is truncated to `take`, which also keeps unwritten slots out of the softmax -- a real `-inf` there would make a fully-masked query compute `exp(-inf - -inf)` = NaN.
+- A fully masked query (left pad) still has *finite* scores (-3.4e38), so the running max is finite and the answer degrades to the uniform average, exactly like the contiguous path.
+- Per-block costs that a kernel removes: `repeat_kv` duplicates KV heads (a kernel indexes heads), and `block()` stacks rows (a kernel reads per-row pointers). What is already gone is the big one: no sequence-length copy per layer per step.
 
 ## Questions to answer
 - Prompt of 5 tokens: what is `logits.shape`, and what does each dimension mean?
@@ -81,4 +89,7 @@
 - `commit` runs after the last layer of a step. What breaks if it runs inside `write_layer`?
 - During a step, does the causal mask need the committed length or committed + new? Why?
 - In a batched paged cache, where does the mapping from (row, position) to memory live?
+- Why does the running softmax need a max and a *weighted sum* of V, not just a sum of weights?
+- What would go wrong if the last (partial) block were not truncated to `take`?
+- Block b's scores come from `q @ K_block^T`. Which columns of the additive mask does that block own?
 - KV cache in bf16 for 1000 tokens, in MB? How many tokens fit in a 3 GB budget in fp32 vs bf16?

@@ -392,6 +392,28 @@ class PagedKVCache:
         while len(table.block_ids) < needed_blocks:
             table.block_ids.append(allocator.allocate())
 
+    def block(
+        self, table: BlockTable, layer: int, block_index: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One logical block's K and V: (kv_heads, block_size, head_dim). A view.
+
+        `block_index` is a *logical* index: block 0 holds positions [0, block_size),
+        block 1 the next block_size, and so on. Which physical block that is depends
+        entirely on the table -- that indirection is the whole point of paging.
+
+        No copy: this slices the pool's first axis, so attention can matmul against
+        the stored memory directly. Contrast `gather`, which concatenates every block
+        into a new tensor.
+        """
+        self._check_layer(layer)
+        if not 0 <= block_index < len(table.block_ids):
+            raise IndexError(
+                f"block {block_index} out of range 0..{len(table.block_ids) - 1} "
+                f"({table.num_tokens} tokens cached)"
+            )
+        block_id = table.block_ids[block_index]
+        return self._k[block_id, layer], self._v[block_id, layer]
+
     def gather(
         self, table: BlockTable, layer: int, length: int | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:

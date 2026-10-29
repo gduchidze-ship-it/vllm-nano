@@ -1,30 +1,39 @@
-"""Our own copy of Qwen2's attention.
+"""Our own copy of Qwen2's attention, plus a paged version of it.
 
 Why copy it: step 3 replaces HF's contiguous `DynamicCache` with blocks, and you
 cannot do that from the outside -- you have to own the code that reads the cache.
 
-This file is deliberately identical to transformers' `Qwen2Attention` +
-`eager_attention_forward`, written out instead of hidden behind a fused kernel:
+Everything up to the cache is shared and deliberately identical to transformers'
+`Qwen2Attention`:
 
     q, k, v      <- projections, then (batch, seq, heads, dim) -> (batch, heads, seq, dim)
     rotary       <- rotate q and k by position
-    cache        <- append this step's k/v, get back everything so far
-    scores       <- q @ k^T / sqrt(head_dim), plus the causal mask
-    weights      <- softmax in fp32 (numerically safer), then back to the model dtype
-    output       <- weights @ v -> (batch, seq, heads * dim) -> o_proj
+
+From there the cache decides which of two functions runs:
+
+    eager_attention   the whole score matrix at once, normalized once. Needs the
+                      full history as one contiguous (batch, heads, length, dim).
+    paged_attention   walks the history block by block and merges each block into a
+                      running softmax. Never builds the history, and never builds the
+                      full score matrix either.
 
 GQA: `num_key_value_groups` query heads share each KV head, which is why K/V are
 smaller than Q and must be repeated before the matmul.
 
-Nothing here is paged yet. That is the point: prove we can reproduce the model's
-numbers with readable code, *then* change where K/V live.
+The two paths are mathematically identical and differ in the last bits, because
+floating-point addition is not associative and the paged loop adds in a different
+order. Token-level output must still match Hugging Face exactly.
 """
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from transformers.cache_utils import Cache
+
+from vllm_nano.models.paged_cache import PagedCache
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -86,11 +95,97 @@ def eager_attention(
     return output.transpose(1, 2).contiguous(), weights
 
 
+def paged_attention(
+    query: torch.Tensor,
+    cache: PagedCache,
+    layer_idx: int,
+    attention_mask: torch.Tensor | None,
+    *,
+    scaling: float,
+    num_kv_groups: int,
+) -> tuple[torch.Tensor, None]:
+    """Attention that walks the cache block by block, with a running softmax.
+
+    Same result as `eager_attention`, organized so the history never exists:
+
+        for each block:
+            scores = q @ K_block^T * scale + mask_slice
+            merge it into (running max, running sum, running weighted V)
+
+    You cannot normalize until you have seen every score, and you do not want to keep
+    every score -- so keep three accumulators and rescale them whenever a bigger
+    maximum shows up:
+
+        new_max    = max(running_max, max(scores))
+        correction = exp(running_max - new_max)     # 1 for the first block, <= 1 later
+        running_out = running_out * correction + exp(scores - new_max) @ V
+        running_sum = running_sum * correction + sum(exp(scores - new_max))
+
+    `running_out / running_sum` is the same softmax average as computing everything at
+    once. The trick is that the cost per block is fixed, so memory stays flat and the
+    sequence length only changes the number of iterations.
+
+    Precision: the accumulators are fp32 (as in flash-attention) and the result is cast
+    back to the query dtype. Reordered additions mean the last bits differ from
+    `eager_attention`; the math does not.
+
+    Masks here are additive but *finite* (HF uses the dtype's most negative value, not
+    -inf), so a query that can see nothing averages V uniformly -- the same answer the
+    contiguous path gives -- instead of producing a NaN.
+    """
+    length = cache.step_length()
+    if length == 0:
+        raise RuntimeError("paged attention ran before any K/V was written")
+
+    block_size = cache.block_size
+    batch, heads, q_len, head_dim = query.shape
+
+    # One accumulator set per (row, head, query position). Independent of `length`.
+    running_max = torch.full(
+        (batch, heads, q_len, 1), -torch.inf, dtype=torch.float32, device=query.device
+    )
+    running_sum = torch.zeros((batch, heads, q_len, 1), dtype=torch.float32, device=query.device)
+    running_out = torch.zeros(
+        (batch, heads, q_len, head_dim), dtype=torch.float32, device=query.device
+    )
+
+    for block_index in range(math.ceil(length / block_size)):
+        start = block_index * block_size
+        take = min(block_size, length - start)  # the last block is usually partial
+
+        key, value = cache.block(layer_idx, block_index)  # (batch, kv_heads, bs, dim)
+        key = repeat_kv(key[:, :, :take], num_kv_groups)
+        value = repeat_kv(value[:, :, :take], num_kv_groups).float()
+
+        scores = torch.matmul(query, key.transpose(2, 3)).float() * scaling
+        if attention_mask is not None:
+            # The mask is indexed by cache position, so block b owns columns
+            # [start, start + take). This alignment is the easy thing to get wrong.
+            scores = scores + attention_mask[..., start : start + take]
+
+        block_max = scores.amax(dim=-1, keepdim=True)
+        new_max = torch.maximum(running_max, block_max)
+        correction = torch.exp(running_max - new_max)
+        weights = torch.exp(scores - new_max)
+
+        running_out = running_out * correction + torch.matmul(weights, value)
+        running_sum = running_sum * correction + weights.sum(dim=-1, keepdim=True)
+        running_max = new_max
+
+    output = (running_out / running_sum).to(query.dtype)
+    # Weights were never materialized, so there is nothing to return for them.
+    return output.transpose(1, 2).contiguous(), None
+
+
 class Qwen2Attention(nn.Module):
     """Drop-in replacement for transformers' `Qwen2Attention`.
 
     Same parameters, same forward contract, so `swap_attention()` can copy the
     trained weights into it and nothing else in the model has to change.
+
+    Two caches are supported: HF's `DynamicCache` (attention gets the contiguous
+    history) and our `PagedCache` (attention reads blocks). The math is the same;
+    only the memory layout and the order of additions differ.
     """
 
     def __init__(self, config, layer_idx: int) -> None:
@@ -118,9 +213,9 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None = None,
+        past_key_values: Cache | PagedCache | None = None,
         **kwargs: object,  # position_ids, use_cache, ... passed down by the decoder layer
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]  # (batch, seq_len)
         head_shape = (*input_shape, -1, self.head_dim)
 
@@ -131,21 +226,30 @@ class Qwen2Attention(nn.Module):
         cos, sin = position_embeddings
         query, key = apply_rotary(query, key, cos, sin)
 
-        # One line, two very different caches. HF's `DynamicCache` concatenates into
-        # contiguous buffers; our `PagedCache` writes into scattered blocks and
-        # gathers the history back. Attention cannot tell the difference -- which is
-        # exactly why paging can be introduced here without touching the math.
-        if past_key_values is not None:
-            key, value = past_key_values.update(key, value, self.layer_idx)
-
-        attn_output, attn_weights = eager_attention(
-            query,
-            key,
-            value,
-            attention_mask,
-            scaling=self.scaling,
-            num_kv_groups=self.num_key_value_groups,
-        )
+        if isinstance(past_key_values, PagedCache):
+            # Store this layer's K/V in blocks, then read the history from them.
+            # The gather is gone: what gets stored is what attention multiplies.
+            past_key_values.update(key, value, self.layer_idx)
+            attn_output, attn_weights = paged_attention(
+                query,
+                past_key_values,
+                self.layer_idx,
+                attention_mask,
+                scaling=self.scaling,
+                num_kv_groups=self.num_key_value_groups,
+            )
+        else:
+            # Contiguous path: the cache appends and hands the whole history back.
+            if past_key_values is not None:
+                key, value = past_key_values.update(key, value, self.layer_idx)
+            attn_output, attn_weights = eager_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                scaling=self.scaling,
+                num_kv_groups=self.num_key_value_groups,
+            )
 
         attn_output = self.o_proj(attn_output.reshape(*input_shape, -1).contiguous())
         return attn_output, attn_weights

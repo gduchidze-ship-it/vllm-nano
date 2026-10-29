@@ -1,12 +1,13 @@
-"""Paged attention: the same numbers, read out of blocks instead of one buffer.
+"""Paged attention: read K/V block by block, never materialize the history.
 
-The claim is strict -- paging changes addresses, not values -- so these tests compare
-with `torch.equal` rather than `allclose`. A tolerance would happily hide an offset
-that is wrong by one token, which is the exact bug paging invites.
+Two different claims, with two different kinds of proof:
 
-The reference is the `DynamicCache` path through the same hand-written attention.
-That path is already proven equal to Hugging Face in `test_attention.py`, so equality
-here means equality all the way to the real model.
+* **Storage is exact.** A block write is a copy, so what sits in the pool must be
+  bit-identical to what a contiguous cache holds. `torch.equal`, no tolerance.
+* **Attention is mathematically identical, not bit-identical.** Block-wise attention
+  merges each block into a running softmax, which adds the same numbers in a different
+  order. Floating-point addition is not associative, so expect ~1e-7 in fp32. The real
+  gate is the token: greedy decoding must still match Hugging Face exactly.
 """
 
 import copy
@@ -25,6 +26,7 @@ LAYERS = 2
 KV_HEADS = 2
 HEAD_DIM = 8
 DECODE_STEPS = 3
+ATOL = 1e-6  # measured ~9e-8; this is the reordering bill, not a model difference
 
 
 def make_step(n_tokens: int, seed: int = 0) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -154,6 +156,30 @@ def test_a_step_that_spans_two_blocks_is_split():
     assert torch.equal(gathered_k, keys[0])
 
 
+def test_block_is_a_view_not_a_copy():
+    """If reading a block copied it, the whole point of paging would be gone.
+
+    Same memory address means attention multiplies directly against the pool.
+    """
+    pool = new_pool()
+    allocator = BlockAllocator(8)
+    table = BlockTable()
+    pool.append(allocator, table, *make_step(BLOCK))
+
+    keys, values = pool.block(table, 0, 0)
+    physical = table.block_ids[0]
+    assert keys.data_ptr() == pool._k[physical, 0].data_ptr()
+    assert values.data_ptr() == pool._v[physical, 0].data_ptr()
+    assert keys.shape == (KV_HEADS, BLOCK, HEAD_DIM)
+
+
+def test_a_block_that_was_never_allocated_is_rejected():
+    pool = new_pool()
+
+    with pytest.raises(IndexError, match="out of range"):
+        pool.block(BlockTable(), 0, 0)
+
+
 # --- the adapter contract the model relies on -------------------------------
 
 
@@ -169,25 +195,41 @@ def test_cache_answers_the_questions_the_model_asks():
     assert cache.get_seq_length() == 4
     assert cache.get_query_offset() == 4
     assert cache.get_mask_sizes(1) == (5, 0)  # one new token attends to 4 + 1
+    assert cache.step_length() == 4  # nothing pending: committed and readable agree
+    assert cache.block_size == BLOCK
+    assert cache.block(0, 0)[0].shape == (1, KV_HEADS, BLOCK, HEAD_DIM)
 
 
-# --- the real thing: our attention, writing into blocks ---------------------
+# --- the real thing: our attention, reading blocks --------------------------
 
 
-def test_paged_attention_matches_dynamic_cache_on_prefill(tiny_model):
-    """Same weights, same math: only the storage changes, so equality must be exact."""
+@pytest.mark.parametrize("block_size", [1, 2, 3, 7])
+def test_paged_attention_matches_contiguous_attention_on_prefill(tiny_model, block_size):
+    """Same weights, same math: only the summation order changes.
+
+    The sweep covers the awkward shapes: one token per block, a block boundary
+    landing mid-prompt, and a prompt that fits in a single partial block.
+    """
     ours = our_model(tiny_model)
-    cache = paged_for(ours)
+    cache = paged_for(ours, block_size=block_size, num_blocks=16)
 
     with torch.inference_mode():
         expected = ours(IDS, use_cache=True)  # HF's DynamicCache
         actual = ours(IDS, past_key_values=cache, use_cache=True)
 
-    assert torch.equal(actual.logits, expected.logits)
+    assert torch.allclose(actual.logits, expected.logits, atol=ATOL)
+    assert torch.equal(actual.logits.argmax(-1), expected.logits.argmax(-1))
+    assert len(cache.tables[0].block_ids) == math.ceil(IDS.shape[1] / block_size)
 
 
 def test_blocks_hold_exactly_what_the_contiguous_cache_holds(tiny_model):
-    """Stronger than matching logits: the stored K/V themselves must be identical."""
+    """The write itself is a copy, so it must be bit-identical.
+
+    Layer 0 is the clean check: its K/V come straight from the embeddings. Later
+    layers can drift in the last bits because their *inputs* come from attention,
+    and attention now adds in a different order -- that drift is upstream of the
+    cache, not in it.
+    """
     ours = our_model(tiny_model)
     cache = paged_for(ours)
 
@@ -197,11 +239,15 @@ def test_blocks_hold_exactly_what_the_contiguous_cache_holds(tiny_model):
 
     for layer in range(tiny_model.config.num_hidden_layers):
         keys, values = cache.cache.gather(cache.tables[0], layer)
-        assert torch.equal(keys, expected.layers[layer].keys[0])
-        assert torch.equal(values, expected.layers[layer].values[0])
+        if layer == 0:
+            assert torch.equal(keys, expected.layers[layer].keys[0])
+            assert torch.equal(values, expected.layers[layer].values[0])
+        else:
+            assert torch.allclose(keys, expected.layers[layer].keys[0], atol=ATOL)
+            assert torch.allclose(values, expected.layers[layer].values[0], atol=ATOL)
 
 
-def test_paged_attention_matches_dynamic_cache_while_decoding(tiny_model):
+def test_paged_attention_matches_contiguous_attention_while_decoding(tiny_model):
     ours = our_model(tiny_model)
     cache = paged_for(ours)
 
@@ -212,10 +258,13 @@ def test_paged_attention_matches_dynamic_cache_while_decoding(tiny_model):
             token = reference.logits[:, -1].argmax(-1, keepdim=True)
             reference = ours(token, past_key_values=reference.past_key_values, use_cache=True)
             actual = ours(token, past_key_values=cache, use_cache=True)
-            assert torch.equal(actual.logits, reference.logits), f"step {step}"
+            assert torch.allclose(actual.logits, reference.logits, atol=ATOL), f"step {step}"
+            assert torch.equal(actual.logits.argmax(-1), reference.logits.argmax(-1)), (
+                f"step {step}"
+            )
 
 
-def test_paged_attention_matches_dynamic_cache_in_a_left_padded_batch(tiny_model):
+def test_paged_attention_matches_contiguous_attention_in_a_left_padded_batch(tiny_model):
     """Paging is per sequence; a batch is a loop over block tables."""
     ours = our_model(tiny_model)
     cache = paged_for(ours, batch=2)
@@ -233,7 +282,7 @@ def test_paged_attention_matches_dynamic_cache_in_a_left_padded_batch(tiny_model
             past_key_values=cache,
             use_cache=True,
         )
-        assert torch.equal(actual.logits, expected.logits)
+        assert torch.allclose(actual.logits, expected.logits, atol=ATOL)
 
         for step in range(2):
             token = expected.logits[:, -1].argmax(-1, keepdim=True)
@@ -253,7 +302,30 @@ def test_paged_attention_matches_dynamic_cache_in_a_left_padded_batch(tiny_model
                 past_key_values=cache,
                 use_cache=True,
             )
-            assert torch.equal(actual.logits, expected.logits), f"step {step}"
+            assert torch.allclose(actual.logits, expected.logits, atol=ATOL), f"step {step}"
+
+    # Pad positions see nothing at all. The running softmax must degrade to a plain
+    # average there, not to 0/0.
+    assert torch.isfinite(actual.logits).all()
+
+
+def test_paged_attention_never_gathers_the_history(tiny_model, monkeypatch):
+    """The architectural claim, pinned: no block is ever concatenated into a history.
+
+    If someone reintroduces a gather for convenience, this fails immediately -- which
+    is the only way to notice, because the output would still be correct.
+    """
+    ours = our_model(tiny_model)
+    cache = paged_for(ours)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("paged attention must read blocks, not gather the history")
+
+    monkeypatch.setattr(PagedKVCache, "gather", refuse)
+    with torch.inference_mode():
+        logits = ours(IDS, past_key_values=cache, use_cache=True).logits
+
+    assert logits.shape == (1, IDS.shape[1], tiny_model.config.vocab_size)
 
 
 def test_paged_generation_picks_the_same_tokens_as_hugging_face(tiny_model):

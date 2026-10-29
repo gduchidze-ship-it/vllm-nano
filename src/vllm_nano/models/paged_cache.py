@@ -1,4 +1,4 @@
-"""Drop the paged KV cache into a Hugging Face model without touching the model.
+"""Turn the paged KV cache into something a Hugging Face model can drive.
 
 The model only ever asks `past_key_values` four questions:
 
@@ -7,17 +7,15 @@ The model only ever asks `past_key_values` four questions:
     get_mask_sizes(q_len)     how wide is the mask?              (kv side)
     update(k, v, layer_idx)   here is this layer's new K/V       (once per layer)
 
-`update` must hand back the *whole* history for that layer, because attention still
-multiplies against one contiguous tensor. That is what `PagedKVCache.gather` builds:
-the numbers are read out of whatever blocks the table points at, copied, and returned.
+The first three are bookkeeping and look exactly like a contiguous cache. The fourth
+is where paging shows up: `update` stores the step in blocks and hands back the slice
+it was given, because the history is *not* gathered into one tensor. Attention reads
+it block by block out of the pool instead (`block()`), which is what removes the
+sequence-length copy from every layer of every step.
 
 So this class is a translator, not a cache. The storage and the block bookkeeping
 live in `core/kv_cache.py`; the per-sequence block tables live with whoever schedules
 requests (one table per row here, and one per request once there is a scheduler).
-
-What it does *not* do yet: avoid the gather. A real PagedAttention kernel computes
-`q @ K_block.T` block by block and never materializes the history. That is the next
-step, and this class is where the reading happens, so it is where that change lands.
 """
 
 from __future__ import annotations
@@ -31,9 +29,9 @@ class PagedCache:
     """A view over a shared paged pool, shaped like Hugging Face's cache.
 
     Holds one `BlockTable` per batch row, and translates the four cache calls above
-    into block allocation, per-layer writes, and a gather. All rows advance together
-    -- which is true for a batch of sequences decoded in lockstep, including
-    left-padded rows whose pad tokens are stored and then masked out by attention.
+    into block allocation, per-layer writes, and block reads for attention. All rows
+    advance together -- which is true for a batch of sequences decoded in lockstep,
+    including left-padded rows whose pad tokens are stored and then masked out.
     """
 
     def __init__(
@@ -84,11 +82,17 @@ class PagedCache:
         *args: object,
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Store this layer's K/V in blocks, then return the whole history.
+        """Store this layer's K/V in blocks and return the step's own tensors.
 
         `key_states`/`value_states` are (batch, kv_heads, n_tokens, head_dim). The
-        batch axis is dropped by writing each row into its own table: paging is per
-        sequence, batching is a loop over sequences.
+        batch axis disappears into one write per row: paging is per sequence, batching
+        is a loop over sequences.
+
+        The return value intentionally is **not** the history. A contiguous cache has
+        to hand attention the whole past because that is the only copy that exists;
+        here the blocks are the copy, and attention takes them from `block()` without
+        concatenating anything. Returning the step unchanged keeps the signature the
+        decoder layer expects while making it obvious there is nothing to unpack.
 
         Layer 0 starts the step and the last layer ends it. That ordering is what
         Hugging Face's decoder does (layers run 0..N-1 once per forward), and it is
@@ -119,21 +123,41 @@ class PagedCache:
         for row, table in enumerate(self.tables):
             self.cache.write_layer(table, layer_idx, key_states[row], value_states[row])
 
-        # The step's tokens are written but not committed, so pass the length
-        # explicitly -- otherwise attention would not see the token it is processing.
-        length = self.tables[0].num_tokens + self._pending
-        gathered = [self.cache.gather(table, layer_idx, length=length) for table in self.tables]
-        # Per row, then a stack: for B>1 this copies the history twice. Both copies
-        # are on the list of things the block-wise kernel deletes.
-        keys = torch.stack([k for k, _ in gathered])
-        values = torch.stack([v for _, v in gathered])
-
         if layer_idx == self.cache.num_layers - 1:
             for table in self.tables:
                 self.cache.commit(table, self._pending)
             self._pending = 0
 
-        return keys, values
+        return key_states, value_states
+
+    # --- what attention reads ------------------------------------------------
+
+    @property
+    def block_size(self) -> int:
+        """Tokens per physical block. Attention slices its mask by this."""
+        return self.cache.block_size
+
+    def step_length(self) -> int:
+        """Tokens attention must read now: committed plus the step being written.
+
+        The step's K/V is already in its blocks (that is what `update` just did), so
+        it must be included -- otherwise every token would attend to a past that
+        stops just short of itself.
+        """
+        return self.tables[0].num_tokens + self._pending
+
+    def block(self, layer_idx: int, block_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Logical block `block_index`, stacked across rows.
+
+        Returns (batch, kv_heads, block_size, head_dim) for K and for V, assembled
+        from that row's own physical block. The stack is a copy of *one block*, not
+        of the history: its size is constant no matter how long the sequence gets.
+        """
+        pairs = [self.cache.block(table, layer_idx, block_index) for table in self.tables]
+        return (
+            torch.stack([keys for keys, _ in pairs]),
+            torch.stack([values for _, values in pairs]),
+        )
 
     # --- housekeeping --------------------------------------------------------
 
